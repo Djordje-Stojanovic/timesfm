@@ -3,86 +3,43 @@
 TimesFM (Time Series Foundation Model) is a pretrained time-series foundation
 model developed by Google Research for time-series forecasting.
 
-*   Paper:
-    [A decoder-only foundation model for time-series forecasting](https://arxiv.org/abs/2310.10688),
-    ICML 2024.
-*   All checkpoints:
-    [TimesFM Hugging Face Collection](https://huggingface.co/collections/google/timesfm-release-66e4be5fdb56e960c1e482a6).
+*   Paper: [A decoder-only foundation model for time-series forecasting](https://arxiv.org/abs/2310.10688), ICML 2024.
+*   Checkpoints: [TimesFM Hugging Face Collection](https://huggingface.co/collections/google/timesfm-release-66e4be5fdb56e960c1e482a6).
 *   [Google Research blog](https://research.google/blog/a-decoder-only-foundation-model-for-time-series-forecasting/).
-*   [TimesFM in BigQuery](https://cloud.google.com/bigquery/docs/timesfm-model):
-    an official Google product.
 
-This open version is not an officially supported Google product.
+**Model Version:** TimesFM 2.5
 
-**Latest Model Version:** TimesFM 2.5
+## Key Features
 
-**Archived Model Versions:**
+- 200M parameters (down from 500M in 2.0)
+- Up to 16k context length (up from 2048)
+- Continuous quantile forecast up to 1k horizon via optional 30M quantile head
+- No frequency indicator needed
+- Flip invariance for negative-valued time series
+- Covariate support via XReg
 
--   1.0 and 2.0: relevant code archived in the sub directory `v1`. You can `pip
-    install timesfm==1.3.0` to install an older version of this package to load
-    them.
-
-## Update - Mar. 19, 2026
-
-Huge shoutout to [@borealBytes](https://github.com/borealBytes) for adding the support for [AGENTS](https://github.com/google-research/timesfm/blob/master/AGENTS.md)! TimesFM [SKILL.md](https://github.com/google-research/timesfm/tree/master/timesfm-forecasting) is out.
-
-## Update - Oct. 29, 2025
-
-Added back the covariate support through XReg for TimesFM 2.5.
-
-
-## Update - Sept. 15, 2025
-
-TimesFM 2.5 is out!
-
-Comparing to TimesFM 2.0, this new 2.5 model:
-
--   uses 200M parameters, down from 500M.
--   supports up to 16k context length, up from 2048.
--   supports continuous quantile forecast up to 1k horizon via an optional 30M
-    quantile head.
--   gets rid of the `frequency` indicator.
--   has a couple of new forecasting flags.
-
-Along with the model upgrade we have also upgraded the inference API. This repo
-will be under construction over the next few weeks to
-
-1.  add support for an upcoming Flax version of the model (faster inference).
-2.  add back covariate support.
-3.  populate more docstrings, docs and notebook.
-
-### Install
+## Install
 
 1.  Clone the repository:
     ```shell
-    git clone https://github.com/google-research/timesfm.git
+    git clone https://github.com/Djordje-Stojanovic/timesfm.git
     cd timesfm
     ```
 
-2.  Create a virtual environment and install dependencies using `uv`:
+2.  Create a virtual environment and install dependencies:
     ```shell
-    # Create a virtual environment
-    uv venv
-    
-    # Activate the environment
-    source .venv/bin/activate
-    
-    # Install the package in editable mode with torch
+    uv venv --python 3.11
+    source .venv/bin/activate       # Linux/Mac
+    source .venv/Scripts/activate   # Windows/Git Bash
+
     uv pip install -e .[torch]
-    # Or with flax
-    uv pip install -e .[flax]
-    # Or XReg is needed
-    uv pip install -e .[xreg]
+    uv pip install yfinance
     ```
 
-3. [Optional] Install your preferred `torch` / `jax` backend based on your OS and accelerators
-(CPU, GPU, TPU or Apple Silicon).:
+3.  [Optional] Install your preferred PyTorch backend:
+    - [Install PyTorch](https://pytorch.org/get-started/locally/) (CUDA recommended for GPU).
 
--   [Install PyTorch](https://pytorch.org/get-started/locally/).
--   [Install Jax](https://docs.jax.dev/en/latest/installation.html#installation)
-    for Flax.
-
-### Code Example
+## Code Example
 
 ```python
 import torch
@@ -109,8 +66,16 @@ point_forecast, quantile_forecast = model.forecast(
     inputs=[
         np.linspace(0, 1, 100),
         np.sin(np.linspace(0, 20, 67)),
-    ],  # Two dummy inputs
+    ],
 )
 point_forecast.shape  # (2, 12)
 quantile_forecast.shape  # (2, 12, 10): mean, then 10th to 90th quantiles.
 ```
+
+## NVIDIA Prediction Test
+
+```shell
+python predict_nvidia.py
+```
+
+Predicts next-day NVDA close price using 5 years of historical data. See `CLAUDE.md` for details.
