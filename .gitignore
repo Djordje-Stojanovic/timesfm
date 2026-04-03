@@ -7,3 +7,5 @@ datasets/
 results/
 timesfm_jax.egg-info/
 development_setup.md
+.claude/worktrees/
+*.egg-info/

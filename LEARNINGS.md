@@ -66,3 +66,30 @@ Append-only log of things learned the hard way. Each entry: date, what happened,
 **Fix:** Add at script top: `sys.stdout.reconfigure(encoding="utf-8")` and run with `PYTHONIOENCODING=utf-8 python -X utf8`.
 
 **How to apply:** Every Python script on Windows that prints non-ASCII should set UTF-8 explicitly.
+
+---
+
+## Monthly Data Needs Different Config Than Daily Stock Data (2026-04-03)
+
+**Problem:** First run of personal finance forecast produced flat predictions (1,412 EUR for every month, no uncertainty). The model predicted a single constant for all 9 future months.
+
+**Root cause:** Three compounding issues:
+1. `CONTEXT_LEN=128` but only 54 data points — excessive padding confused the model
+2. `infer_is_positive=False` for EUR amounts that are always positive — model wasted capacity on impossible negative values
+3. `force_flip_invariance=True` for positive-only series — averaging f(x) and -f(-x) cancels signal
+
+**Fix:**
+- Set `CONTEXT_LEN=64` (nearest multiple of patch_len=32 above our 54 points)
+- For positive series (savings, investments): `infer_is_positive=True`, `force_flip_invariance=False`
+- For series that can be negative (return %): `infer_is_positive=False`, `force_flip_invariance=True`
+- Recompile model between series with different settings
+
+**How to apply:** Always match ForecastConfig to the data characteristics. Monthly data with 50-100 points needs different settings than daily stock data with 1000+ points. The `infer_is_positive` and `force_flip_invariance` flags have a big impact on short series.
+
+---
+
+## Portfolio Log-Returns Extrapolate Aggressively (2026-04-03)
+
+**Observation:** Portfolio value forecast using log-returns predicted +119% growth in 9 months (115K -> 253K EUR). This is because the recent monthly log-returns average ~2.5%/month, and the model extrapolates this linearly. For a portfolio that has been growing steadily, this is the model's best guess — but it ignores mean reversion, market conditions, and the fact that past returns don't predict future returns.
+
+**How to apply:** Log-return forecasts for portfolios should be treated as "if current trend continues" scenarios, not reliable predictions. The uncertainty bands (P10-P90) are more useful than the point forecast. For financial planning, use the P10 (bearish) scenario as the conservative estimate.
