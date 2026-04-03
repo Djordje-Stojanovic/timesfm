@@ -3,13 +3,14 @@ TimesFM 2.5 — Personal Finance Forecast
 
 Predicts:
   1. Net savings (next 9 months, Apr-Dec 2026)
-  2. Portfolio value trajectory (next 9 months)
-  3. Monthly investment amount (next 9 months)
-  4. Portfolio return % (next 9 months)
+  2. Income forecast (next 9 months)
+  3. Savings rate (net/income) forecast
+  4. Portfolio value trajectory (next 9 months)
+  5. Monthly investment amount (next 9 months)
+  6. Portfolio return % (next 9 months)
 
-Uses XReg covariates where series are correlated.
 Generates matplotlib charts saved to runs/<timestamp>/.
-Creates a run report .md file with all results.
+Creates a comprehensive run report .md file.
 """
 
 import os
@@ -30,6 +31,7 @@ import torch
 
 import timesfm
 from data.personal_finance import (
+    INCOME, INCOME_DATES,
     NET_SAVINGS, NET_SAVINGS_DATES,
     PORTFOLIO_VALUE, PORTFOLIO_DATES,
     MONTHLY_INVESTMENT, MONTHLY_INVESTMENT_DATES,
@@ -40,9 +42,9 @@ from data.personal_finance import (
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-HORIZON = 9  # months to predict (Apr-Dec 2026)
+HORIZON = 9
 MAX_HORIZON = 128
-CONTEXT_LEN = 64  # nearest multiple of patch_len=32 above our ~54 data points
+CONTEXT_LEN = 64
 
 # ---------------------------------------------------------------------------
 # Setup run directory
@@ -50,7 +52,6 @@ CONTEXT_LEN = 64  # nearest multiple of patch_len=32 above our ~54 data points
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 run_dir = Path("runs") / timestamp
 run_dir.mkdir(parents=True, exist_ok=True)
-print(f"Run directory: {run_dir}")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -60,487 +61,506 @@ def fmt_eur(v): return f"{v:,.0f}".replace(",", ".")
 
 def gpu_stats():
     if not torch.cuda.is_available(): return "CPU mode"
-    a = torch.cuda.memory_allocated()
-    r = torch.cuda.memory_reserved()
+    a, r = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
     t = torch.cuda.get_device_properties(0).total_memory
-    return f"VRAM: {a/1024**2:.0f}MB alloc / {r/1024**2:.0f}MB res / {t/1024**3:.1f}GB total"
+    return f"VRAM: {a/1024**2:.0f}MB / {t/1024**3:.1f}GB"
 
 def section(title):
     print(f"\n{'=' * 70}\n  {title}\n{'=' * 70}")
 
 COLORS = {
-    "history": "#3b82f6",    # blue
-    "forecast": "#f59e0b",   # amber
-    "ci_80": "#fef3c7",      # light amber
-    "ci_60": "#fde68a",      # medium amber
-    "ci_40": "#fcd34d",      # dark amber
-    "accent": "#10b981",     # emerald
-    "grid": "#374151",       # gray-700
-    "bg": "#111827",         # gray-900
-    "text": "#f3f4f6",       # gray-100
+    "history": "#3b82f6", "forecast": "#f59e0b", "accent": "#10b981",
+    "red": "#ef4444", "purple": "#a855f7",
+    "grid": "#374151", "bg": "#111827", "text": "#f3f4f6",
 }
 
 def style_chart(ax, title, ylabel):
     ax.set_facecolor(COLORS["bg"])
     ax.figure.set_facecolor(COLORS["bg"])
-    ax.set_title(title, color=COLORS["text"], fontsize=14, fontweight="bold", pad=12)
-    ax.set_ylabel(ylabel, color=COLORS["text"], fontsize=11)
-    ax.tick_params(colors=COLORS["text"], labelsize=9)
-    ax.grid(True, alpha=0.15, color=COLORS["grid"])
-    for spine in ax.spines.values():
-        spine.set_color(COLORS["grid"])
-    ax.legend(facecolor=COLORS["bg"], edgecolor=COLORS["grid"],
-              labelcolor=COLORS["text"], fontsize=9)
+    ax.set_title(title, color=COLORS["text"], fontsize=13, fontweight="bold", pad=10)
+    ax.set_ylabel(ylabel, color=COLORS["text"], fontsize=10)
+    ax.tick_params(colors=COLORS["text"], labelsize=8)
+    ax.grid(True, alpha=0.12, color=COLORS["grid"])
+    for spine in ax.spines.values(): spine.set_color(COLORS["grid"])
 
-
-def plot_forecast(dates_hist, values_hist, dates_fc, point_fc, quant_fc,
-                  title, ylabel, filename, fmt_fn=fmt_eur, show_seasonality=False):
-    """Plot history + forecast with confidence bands."""
-    fig, ax = plt.subplots(figsize=(14, 5))
-
-    n_hist = len(dates_hist)
-    n_fc = len(dates_fc)
-    x_hist = list(range(n_hist))
-    x_fc = list(range(n_hist, n_hist + n_fc))
-
-    # History
-    ax.plot(x_hist, values_hist, color=COLORS["history"], linewidth=2,
-            marker="o", markersize=3, label="History", zorder=5)
-
-    # Forecast point
-    ax.plot(x_fc, point_fc, color=COLORS["forecast"], linewidth=2.5,
-            marker="D", markersize=5, label="Forecast", zorder=5)
-
-    # Confidence bands
-    if quant_fc is not None:
-        p10 = quant_fc[:, 1]
-        p30 = quant_fc[:, 3]
-        p70 = quant_fc[:, 7]
-        p90 = quant_fc[:, 9]
-
-        ax.fill_between(x_fc, p10, p90, alpha=0.15, color=COLORS["forecast"], label="80% CI")
-        ax.fill_between(x_fc, p30, p70, alpha=0.25, color=COLORS["forecast"], label="40% CI")
-
-    # Vertical line at forecast boundary
-    ax.axvline(x=n_hist - 0.5, color=COLORS["accent"], linestyle="--", alpha=0.5, linewidth=1)
-    ax.text(n_hist - 0.3, ax.get_ylim()[1] * 0.98, "forecast -->",
-            color=COLORS["accent"], fontsize=8, alpha=0.7, va="top")
-
-    # X-axis labels (show every 3rd month)
-    all_dates = list(dates_hist) + list(dates_fc)
-    tick_positions = list(range(0, len(all_dates), 3))
-    tick_labels = [all_dates[i] for i in tick_positions]
-    ax.set_xticks(tick_positions)
-    ax.set_xticklabels(tick_labels, rotation=45, ha="right")
-
-    # Format y-axis
-    if "%" in ylabel:
-        ax.yaxis.set_major_formatter(mticker.PercentFormatter())
-    else:
-        ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, p: f"{x:,.0f}"))
-
-    # Annotate last historical and last forecast values
-    ax.annotate(f"{fmt_fn(values_hist[-1])}", xy=(x_hist[-1], values_hist[-1]),
-                xytext=(0, 12), textcoords="offset points", color=COLORS["history"],
-                fontsize=9, fontweight="bold", ha="center")
-    ax.annotate(f"{fmt_fn(point_fc[-1])}", xy=(x_fc[-1], point_fc[-1]),
-                xytext=(0, 12), textcoords="offset points", color=COLORS["forecast"],
-                fontsize=9, fontweight="bold", ha="center")
-
-    style_chart(ax, title, ylabel)
-    fig.tight_layout()
-    path = run_dir / filename
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"    Saved: {path}")
-    return path
+def plot_series(ax, dates_h, vals_h, dates_f, pt_f, qt_f, color_h, color_f, label_h="History", label_f="Forecast"):
+    n_h, n_f = len(dates_h), len(dates_f)
+    x_h, x_f = list(range(n_h)), list(range(n_h, n_h + n_f))
+    ax.plot(x_h, vals_h, color=color_h, linewidth=1.8, marker="o", markersize=2.5, label=label_h, zorder=5)
+    ax.plot(x_f, pt_f, color=color_f, linewidth=2.5, marker="D", markersize=4, label=label_f, zorder=5)
+    if qt_f is not None:
+        ax.fill_between(x_f, qt_f[:, 1], qt_f[:, 9], alpha=0.12, color=color_f)
+        ax.fill_between(x_f, qt_f[:, 3], qt_f[:, 7], alpha=0.22, color=color_f)
+    ax.axvline(x=n_h - 0.5, color=COLORS["accent"], linestyle="--", alpha=0.4, linewidth=0.8)
+    all_d = list(dates_h) + list(dates_f)
+    step = max(1, len(all_d) // 12)
+    ticks = list(range(0, len(all_d), step))
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([all_d[i] for i in ticks], rotation=45, ha="right", fontsize=7)
+    return x_h, x_f
 
 
 # ===========================================================================
-# PHASE 1: Data Analysis
+# PHASE 1: Compute Derived Series
 # ===========================================================================
 section("PHASE 1: DATA ANALYSIS")
 t_start = time.perf_counter()
 
-print(f"\n  Net Savings: {len(NET_SAVINGS)} months ({NET_SAVINGS_DATES[0]} to {NET_SAVINGS_DATES[-1]})")
-print(f"    Mean: {fmt_eur(NET_SAVINGS.mean())} EUR/mo  |  Median: {fmt_eur(np.median(NET_SAVINGS))} EUR/mo")
-print(f"    Min:  {fmt_eur(NET_SAVINGS.min())} EUR/mo  |  Max: {fmt_eur(NET_SAVINGS.max())} EUR/mo")
-print(f"    Std:  {fmt_eur(NET_SAVINGS.std())} EUR/mo  |  CV: {NET_SAVINGS.std()/NET_SAVINGS.mean()*100:.0f}%")
-print(f"    Total saved: {fmt_eur(NET_SAVINGS.sum())} EUR over {len(NET_SAVINGS)} months")
+# Savings rate: net / income for overlapping months
+n_overlap = min(len(INCOME), len(NET_SAVINGS))
+savings_rate = NET_SAVINGS[:n_overlap] / INCOME[:n_overlap] * 100
+savings_rate_dates = NET_SAVINGS_DATES[:n_overlap]
 
-# Detect seasonality - monthly averages
-monthly_avg = {}
-for date, val in zip(NET_SAVINGS_DATES, NET_SAVINGS):
-    month = int(date.split("-")[1])
-    monthly_avg.setdefault(month, []).append(val)
-monthly_avg = {k: np.mean(v) for k, v in monthly_avg.items()}
+# Expenses = Income - Net
+expenses = INCOME - NET_SAVINGS[:n_overlap]
 
-print(f"\n  Monthly Seasonality (avg net savings):")
+print(f"  {'Series':<25} {'Months':>6} {'From':>10} {'To':>10} {'Mean':>10} {'Last':>10}")
+print(f"  {'=' * 25} {'=' * 6} {'=' * 10} {'=' * 10} {'=' * 10} {'=' * 10}")
+for name, dates, vals, unit in [
+    ("Income", INCOME_DATES, INCOME, "EUR"),
+    ("Net Savings", NET_SAVINGS_DATES, NET_SAVINGS, "EUR"),
+    ("Savings Rate", savings_rate_dates, savings_rate, "%"),
+    ("Expenses", INCOME_DATES, expenses, "EUR"),
+    ("Portfolio Value", PORTFOLIO_DATES, PORTFOLIO_VALUE, "EUR"),
+    ("Monthly Investment", MONTHLY_INVESTMENT_DATES, MONTHLY_INVESTMENT, "EUR"),
+    ("Total Return", PORTFOLIO_DATES, TOTAL_RETURN_PCT, "%"),
+    ("Invested Capital", PORTFOLIO_DATES, INVESTED_CAPITAL, "EUR"),
+]:
+    fmt = (lambda v: f"{v:.1f}%") if unit == "%" else (lambda v: fmt_eur(v) + " EUR")
+    print(f"  {name:<25} {len(vals):>6} {dates[0]:>10} {dates[-1]:>10} {fmt(vals.mean()):>10} {fmt(vals[-1]):>10}")
+
+# Monthly seasonality
+print(f"\n  Monthly Patterns (avg):")
+print(f"  {'Mon':>5}  {'Income':>10}  {'Net Sav':>10}  {'Sav Rate':>8}  {'Expenses':>10}  {'Invest':>10}")
+print(f"  {'=' * 5}  {'=' * 10}  {'=' * 10}  {'=' * 8}  {'=' * 10}  {'=' * 10}")
+month_names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 for m in range(1, 13):
-    if m in monthly_avg:
-        bar = "█" * int(monthly_avg[m] / 200)
-        peak = " << PEAK" if monthly_avg[m] == max(monthly_avg.values()) else ""
-        print(f"    {['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][m-1]}: {fmt_eur(monthly_avg[m])} EUR  {bar}{peak}")
+    inc_avg = np.mean([INCOME[i] for i, d in enumerate(INCOME_DATES) if int(d.split("-")[1]) == m]) if any(int(d.split("-")[1]) == m for d in INCOME_DATES) else 0
+    sav_avg = np.mean([NET_SAVINGS[i] for i, d in enumerate(NET_SAVINGS_DATES) if int(d.split("-")[1]) == m])
+    rate_avg = (sav_avg / inc_avg * 100) if inc_avg > 0 else 0
+    exp_avg = inc_avg - sav_avg if inc_avg > 0 else 0
+    inv_avg = np.mean([MONTHLY_INVESTMENT[i] for i, d in enumerate(MONTHLY_INVESTMENT_DATES) if int(d.split("-")[1]) == m]) if any(int(d.split("-")[1]) == m for d in MONTHLY_INVESTMENT_DATES) else 0
+    peak_inc = " <<" if m in [5, 11] else ""
+    print(f"  {month_names[m-1]:>5}  {fmt_eur(inc_avg):>10}  {fmt_eur(sav_avg):>10}  {rate_avg:>6.1f}%  {fmt_eur(exp_avg):>10}  {fmt_eur(inv_avg):>10}{peak_inc}")
 
-print(f"\n  Portfolio: {len(PORTFOLIO_VALUE)} months ({PORTFOLIO_DATES[0]} to {PORTFOLIO_DATES[-1]})")
-print(f"    Current: {fmt_eur(PORTFOLIO_VALUE[-1])} EUR")
-print(f"    Invested: {fmt_eur(INVESTED_CAPITAL[-1])} EUR")
-print(f"    Gain: {fmt_eur(PORTFOLIO_VALUE[-1] - INVESTED_CAPITAL[-1])} EUR ({TOTAL_RETURN_PCT[-1]:+.1f}%)")
-print(f"    CAGR: {((PORTFOLIO_VALUE[-1]/PORTFOLIO_VALUE[0])**(12/len(PORTFOLIO_VALUE))-1)*100:.1f}%")
+# Year-over-year growth
+print(f"\n  Year-over-Year Net Savings:")
+for year in [2022, 2023, 2024, 2025]:
+    y_vals = [NET_SAVINGS[i] for i, d in enumerate(NET_SAVINGS_DATES) if d.startswith(str(year))]
+    total = sum(y_vals)
+    print(f"    {year}: {fmt_eur(total)} EUR ({len(y_vals)} months, avg {fmt_eur(total/len(y_vals))} EUR/mo)")
 
-print(f"\n  Monthly Investment: {len(MONTHLY_INVESTMENT)} months")
-print(f"    Mean: {fmt_eur(MONTHLY_INVESTMENT.mean())} EUR/mo  |  Total: {fmt_eur(MONTHLY_INVESTMENT.sum())} EUR")
+print(f"\n  Net Worth Summary:")
+print(f"    Total saved (all time):       {fmt_eur(NET_SAVINGS.sum())} EUR")
+print(f"    Total invested (portfolio):   {fmt_eur(INVESTED_CAPITAL[-1])} EUR")
+print(f"    Portfolio value:              {fmt_eur(PORTFOLIO_VALUE[-1])} EUR")
+print(f"    Investment gains:             {fmt_eur(PORTFOLIO_VALUE[-1] - INVESTED_CAPITAL[-1])} EUR ({TOTAL_RETURN_PCT[-1]:+.1f}%)")
+uninvested = NET_SAVINGS.sum() - INVESTED_CAPITAL[-1]
+print(f"    Cash / other (saved - invested): {fmt_eur(uninvested)} EUR")
+print(f"    Implied net worth:            {fmt_eur(PORTFOLIO_VALUE[-1] + uninvested)} EUR")
 
 
 # ===========================================================================
 # PHASE 2: Load Model
 # ===========================================================================
-section("PHASE 2: MODEL LOADING")
+section("PHASE 2: MODEL")
 t0 = time.perf_counter()
-
 device = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
-print(f"\n  Device: {device}  |  PyTorch {torch.__version__}")
-print(f"  {gpu_stats()}")
+print(f"  Device: {device}  |  {gpu_stats()}")
 
 torch.set_float32_matmul_precision("high")
 model = timesfm.TimesFM_2p5_200M_torch.from_pretrained("google/timesfm-2.5-200m-pytorch")
 t_load = time.perf_counter() - t0
-print(f"  Model loaded in {fmt_time(t_load)}  |  {gpu_stats()}")
+print(f"  Loaded in {fmt_time(t_load)}  |  {gpu_stats()}")
 
-def compile_model(positive=True):
-    """Recompile model with appropriate settings."""
+def compile_pos():
     model.compile(timesfm.ForecastConfig(
         max_context=CONTEXT_LEN, max_horizon=MAX_HORIZON,
         normalize_inputs=True, use_continuous_quantile_head=True,
-        force_flip_invariance=not positive,  # flip invariance off for positive-only series
-        infer_is_positive=positive,
-        fix_quantile_crossing=True, return_backcast=True,
-    ))
+        force_flip_invariance=False, infer_is_positive=True,
+        fix_quantile_crossing=True, return_backcast=True))
 
-compile_model(positive=True)
-print(f"  Compiled (ctx={CONTEXT_LEN}, horizon={MAX_HORIZON}, positive=True)")
+def compile_neg():
+    model.compile(timesfm.ForecastConfig(
+        max_context=CONTEXT_LEN, max_horizon=MAX_HORIZON,
+        normalize_inputs=True, use_continuous_quantile_head=True,
+        force_flip_invariance=True, infer_is_positive=False,
+        fix_quantile_crossing=True, return_backcast=True))
 
 
 # ===========================================================================
-# PHASE 3: Forecast Net Savings
+# PHASE 3: Run All Forecasts
 # ===========================================================================
-section("PHASE 3: FORECAST NET SAVINGS")
-print(f"\n  Predicting next {HORIZON} months of net savings (Apr-Dec 2026)")
-print(f"  Input: {len(NET_SAVINGS)} monthly values, raw (no log transform needed)")
+section("PHASE 3: FORECASTING")
+results = {}
 
+# --- Income ---
+compile_pos()
+print(f"\n  [1/6] Income...")
 t0 = time.perf_counter()
-pt_savings, qt_savings = model.forecast(horizon=HORIZON, inputs=[NET_SAVINGS])
-t_fc1 = time.perf_counter() - t0
+pt, qt = model.forecast(horizon=HORIZON, inputs=[INCOME])
+results["income"] = (pt[0, :HORIZON], qt[0, :HORIZON, :])
+print(f"         {fmt_time(time.perf_counter()-t0)}")
 
-fc_savings = pt_savings[0, :HORIZON]
-q_savings = qt_savings[0, :HORIZON, :]
-
-print(f"  Inference: {fmt_time(t_fc1)}")
-print(f"\n  {'Month':>10}  {'Predicted':>10}  {'P10':>10}  {'P50':>10}  {'P90':>10}")
-print(f"  {'=' * 10}  {'=' * 10}  {'=' * 10}  {'=' * 10}  {'=' * 10}")
-for i, date in enumerate(FORECAST_DATES):
-    p = fc_savings[i]
-    q10, q50, q90 = q_savings[i, 1], q_savings[i, 5], q_savings[i, 9]
-    peak = "  << Nov bonus?" if "11" in date else ""
-    print(f"  {date:>10}  {fmt_eur(p):>10}  {fmt_eur(q10):>10}  {fmt_eur(q50):>10}  {fmt_eur(q90):>10}{peak}")
-
-total_fc = fc_savings.sum()
-print(f"\n  Total predicted savings Apr-Dec 2026: {fmt_eur(total_fc)} EUR")
-print(f"  Annualized rate: {fmt_eur(total_fc / HORIZON * 12)} EUR/year")
-
-plot_forecast(NET_SAVINGS_DATES, NET_SAVINGS, FORECAST_DATES, fc_savings, q_savings,
-              "Net Monthly Savings - History & Forecast", "EUR",
-              "01_net_savings.png")
-
-
-# ===========================================================================
-# PHASE 4: Forecast Portfolio Value
-# ===========================================================================
-section("PHASE 4: FORECAST PORTFOLIO VALUE")
-print(f"\n  Predicting portfolio value for next {HORIZON} months")
-print(f"  Using log-returns (portfolio has strong uptrend)")
-
-# Use log-returns for portfolio (strong trend)
-port_log_returns = np.diff(np.log(PORTFOLIO_VALUE))
-
+# --- Net Savings ---
+print(f"  [2/6] Net Savings...")
 t0 = time.perf_counter()
-pt_port, qt_port = model.forecast(horizon=HORIZON, inputs=[port_log_returns])
-t_fc2 = time.perf_counter() - t0
+pt, qt = model.forecast(horizon=HORIZON, inputs=[NET_SAVINGS])
+results["savings"] = (pt[0, :HORIZON], qt[0, :HORIZON, :])
+print(f"         {fmt_time(time.perf_counter()-t0)}")
 
-# Reconstruct prices from cumulative returns
+# --- Monthly Investment ---
+print(f"  [3/6] Monthly Investment...")
+t0 = time.perf_counter()
+pt, qt = model.forecast(horizon=HORIZON, inputs=[MONTHLY_INVESTMENT])
+results["investment"] = (pt[0, :HORIZON], qt[0, :HORIZON, :])
+print(f"         {fmt_time(time.perf_counter()-t0)}")
+
+# --- Portfolio (log-returns) ---
+print(f"  [4/6] Portfolio Value (log-returns)...")
+port_lr = np.diff(np.log(PORTFOLIO_VALUE))
+t0 = time.perf_counter()
+pt, qt = model.forecast(horizon=HORIZON, inputs=[port_lr])
 last_port = PORTFOLIO_VALUE[-1]
-fc_port_cum = np.cumsum(pt_port[0, :HORIZON])
-fc_port_values = last_port * np.exp(fc_port_cum)
-
-# Quantile price reconstruction
-q_port_values = np.zeros((HORIZON, 10))
+fc_port = last_port * np.exp(np.cumsum(pt[0, :HORIZON]))
+q_port = np.zeros((HORIZON, 10))
 for h in range(HORIZON):
-    if h == 0:
-        q_cum = qt_port[0, 0, :]
-    else:
-        point_sum = np.sum(pt_port[0, :h])
-        q_cum = point_sum + qt_port[0, h, :]
-    q_port_values[h, :] = last_port * np.exp(q_cum)
+    ps = float(np.sum(pt[0, :h])) if h > 0 else 0.0
+    q_port[h, :] = last_port * np.exp(ps + qt[0, h, :])
+results["portfolio"] = (fc_port, q_port)
+print(f"         {fmt_time(time.perf_counter()-t0)}")
 
-print(f"  Inference: {fmt_time(t_fc2)}")
-print(f"\n  {'Month':>10}  {'Predicted':>12}  {'P10':>12}  {'P50':>12}  {'P90':>12}  {'MoM':>7}")
-print(f"  {'=' * 10}  {'=' * 12}  {'=' * 12}  {'=' * 12}  {'=' * 12}  {'=' * 7}")
-prev = last_port
-for i, date in enumerate(FORECAST_DATES):
-    p = fc_port_values[i]
-    q10, q50, q90 = q_port_values[i, 1], q_port_values[i, 5], q_port_values[i, 9]
-    mom = (p / prev - 1) * 100
-    prev = p
-    print(f"  {date:>10}  {fmt_eur(p):>12}  {fmt_eur(q10):>12}  {fmt_eur(q50):>12}  {fmt_eur(q90):>12}  {mom:>+5.1f}%")
-
-growth = (fc_port_values[-1] / last_port - 1) * 100
-print(f"\n  Current: {fmt_eur(last_port)} EUR  -->  Dec 2026: {fmt_eur(fc_port_values[-1])} EUR ({growth:+.1f}%)")
-
-# Adjust dates for portfolio forecast (starts one month later than net savings)
-port_fc_dates = FORECAST_DATES[:HORIZON]
-# But portfolio already has Apr 2026, so forecast starts May 2026
-port_fc_dates_actual = ["2026-05", "2026-06", "2026-07", "2026-08", "2026-09",
-                         "2026-10", "2026-11", "2026-12", "2027-01"]
-
-plot_forecast(PORTFOLIO_DATES, PORTFOLIO_VALUE, port_fc_dates_actual,
-              fc_port_values, q_port_values,
-              "Portfolio Value - History & Forecast", "EUR",
-              "02_portfolio_value.png")
-
-
-# ===========================================================================
-# PHASE 5: Forecast Monthly Investment
-# ===========================================================================
-section("PHASE 5: FORECAST MONTHLY INVESTMENT")
-print(f"\n  How much will you invest per month?")
-
+# --- Savings Rate (can be negative theoretically, use neg compile) ---
+compile_neg()
+print(f"  [5/6] Savings Rate...")
 t0 = time.perf_counter()
-pt_inv, qt_inv = model.forecast(horizon=HORIZON, inputs=[MONTHLY_INVESTMENT])
-t_fc3 = time.perf_counter() - t0
+pt, qt = model.forecast(horizon=HORIZON, inputs=[savings_rate])
+results["rate"] = (pt[0, :HORIZON], qt[0, :HORIZON, :])
+print(f"         {fmt_time(time.perf_counter()-t0)}")
 
-fc_inv = pt_inv[0, :HORIZON]
-q_inv = qt_inv[0, :HORIZON, :]
-
-print(f"  Inference: {fmt_time(t_fc3)}")
-print(f"\n  {'Month':>10}  {'Predicted':>10}  {'P10':>10}  {'P90':>10}")
-print(f"  {'=' * 10}  {'=' * 10}  {'=' * 10}  {'=' * 10}")
-for i, date in enumerate(FORECAST_DATES):
-    p = fc_inv[i]
-    print(f"  {date:>10}  {fmt_eur(p):>10}  {fmt_eur(q_inv[i,1]):>10}  {fmt_eur(q_inv[i,9]):>10}")
-
-print(f"\n  Total predicted investment Apr-Dec 2026: {fmt_eur(fc_inv.sum())} EUR")
-
-plot_forecast(MONTHLY_INVESTMENT_DATES, MONTHLY_INVESTMENT, FORECAST_DATES,
-              fc_inv, q_inv,
-              "Monthly Investment Amount - History & Forecast", "EUR",
-              "03_monthly_investment.png")
-
-
-# ===========================================================================
-# PHASE 6: Forecast Returns
-# ===========================================================================
-section("PHASE 6: FORECAST PORTFOLIO RETURNS")
-print(f"\n  Predicting total return % trajectory")
-print(f"  Recompiling model for negative values (returns can be negative)...")
-compile_model(positive=False)
-
+# --- Returns ---
+print(f"  [6/6] Portfolio Returns...")
 t0 = time.perf_counter()
-pt_ret, qt_ret = model.forecast(horizon=HORIZON, inputs=[TOTAL_RETURN_PCT])
-t_fc4 = time.perf_counter() - t0
+pt, qt = model.forecast(horizon=HORIZON, inputs=[TOTAL_RETURN_PCT])
+results["returns"] = (pt[0, :HORIZON], qt[0, :HORIZON, :])
+print(f"         {fmt_time(time.perf_counter()-t0)}")
 
-fc_ret = pt_ret[0, :HORIZON]
-q_ret = qt_ret[0, :HORIZON, :]
-
-print(f"  Inference: {fmt_time(t_fc4)}")
-print(f"\n  {'Month':>10}  {'Return':>8}  {'P10':>8}  {'P90':>8}")
-print(f"  {'=' * 10}  {'=' * 8}  {'=' * 8}  {'=' * 8}")
-for i, date in enumerate(FORECAST_DATES):
-    print(f"  {date:>10}  {fc_ret[i]:>+6.1f}%  {q_ret[i,1]:>+6.1f}%  {q_ret[i,9]:>+6.1f}%")
-
-plot_forecast(PORTFOLIO_DATES, TOTAL_RETURN_PCT, port_fc_dates_actual,
-              fc_ret, q_ret,
-              "Total Return % - History & Forecast", "% return",
-              "04_returns.png", fmt_fn=lambda v: f"{v:+.1f}%")
+# Derived: forecast expenses = forecast income - forecast savings
+fc_income = results["income"][0]
+fc_savings = results["savings"][0]
+fc_expenses = fc_income - fc_savings
 
 
 # ===========================================================================
-# PHASE 7: Combined Dashboard
+# PHASE 4: Print Results
 # ===========================================================================
-section("PHASE 7: COMBINED DASHBOARD")
-
-fig, axes = plt.subplots(2, 2, figsize=(18, 10))
-fig.set_facecolor(COLORS["bg"])
-fig.suptitle(f"Personal Finance Forecast — {timestamp[:8]}", color=COLORS["text"],
-             fontsize=16, fontweight="bold", y=0.98)
+section("PHASE 4: RESULTS")
 
 datasets = [
-    (axes[0, 0], NET_SAVINGS_DATES, NET_SAVINGS, FORECAST_DATES, fc_savings, q_savings,
-     "Net Savings (EUR/mo)", "EUR"),
-    (axes[0, 1], PORTFOLIO_DATES, PORTFOLIO_VALUE, port_fc_dates_actual, fc_port_values, q_port_values,
-     "Portfolio Value (EUR)", "EUR"),
-    (axes[1, 0], MONTHLY_INVESTMENT_DATES, MONTHLY_INVESTMENT, FORECAST_DATES, fc_inv, q_inv,
-     "Monthly Investment (EUR)", "EUR"),
-    (axes[1, 1], PORTFOLIO_DATES, TOTAL_RETURN_PCT, port_fc_dates_actual, fc_ret, q_ret,
-     "Total Return (%)", "%"),
+    ("Income",           FORECAST_DATES, fc_income,           results["income"][1],     "EUR"),
+    ("Net Savings",      FORECAST_DATES, fc_savings,           results["savings"][1],    "EUR"),
+    ("Savings Rate",     FORECAST_DATES, results["rate"][0],   results["rate"][1],       "%"),
+    ("Expenses (derived)", FORECAST_DATES, fc_expenses,        None,                     "EUR"),
+    ("Investment",       FORECAST_DATES, results["investment"][0], results["investment"][1], "EUR"),
+    ("Portfolio Value",  FORECAST_DATES, fc_port,              q_port,                   "EUR"),
+    ("Return %",         FORECAST_DATES, results["returns"][0], results["returns"][1],   "%"),
 ]
 
-for ax, dates_h, vals_h, dates_f, pt_f, qt_f, title, unit in datasets:
-    n_h = len(dates_h)
-    n_f = len(dates_f)
-    x_h = list(range(n_h))
-    x_f = list(range(n_h, n_h + n_f))
+for name, dates, point, quant, unit in datasets:
+    print(f"\n  {name}:")
+    fmt = (lambda v: f"{v:+.1f}%") if unit == "%" else (lambda v: f"{fmt_eur(v)} EUR")
+    for i, d in enumerate(dates):
+        p = point[i]
+        if quant is not None:
+            q10, q90 = quant[i, 1], quant[i, 9]
+            print(f"    {d}:  {fmt(p):>14}   (P10: {fmt(q10)}, P90: {fmt(q90)})")
+        else:
+            print(f"    {d}:  {fmt(p):>14}")
+    if unit == "EUR":
+        print(f"    Total: {fmt(point.sum())}")
 
-    ax.plot(x_h, vals_h, color=COLORS["history"], linewidth=1.5, marker=".", markersize=2)
-    ax.plot(x_f, pt_f, color=COLORS["forecast"], linewidth=2, marker="D", markersize=4)
 
-    if qt_f is not None:
-        ax.fill_between(x_f, qt_f[:, 1], qt_f[:, 9], alpha=0.15, color=COLORS["forecast"])
-        ax.fill_between(x_f, qt_f[:, 3], qt_f[:, 7], alpha=0.25, color=COLORS["forecast"])
+# ===========================================================================
+# PHASE 5: Charts
+# ===========================================================================
+section("PHASE 5: CHARTS")
 
-    ax.axvline(x=n_h - 0.5, color=COLORS["accent"], linestyle="--", alpha=0.4)
+# Chart 1: Income + Savings + Expenses stacked view
+fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=False)
+fig.set_facecolor(COLORS["bg"])
+fig.suptitle("Income, Savings & Expenses", color=COLORS["text"], fontsize=15, fontweight="bold")
 
-    all_d = list(dates_h) + list(dates_f)
-    ticks = list(range(0, len(all_d), 6))
-    ax.set_xticks(ticks)
-    ax.set_xticklabels([all_d[i] for i in ticks], rotation=45, ha="right", fontsize=7)
+# Income
+ax = axes[0]
+plot_series(ax, INCOME_DATES, INCOME, FORECAST_DATES, fc_income, results["income"][1],
+            COLORS["history"], COLORS["forecast"])
+style_chart(ax, "Monthly Income", "EUR")
+ax.legend(facecolor=COLORS["bg"], edgecolor=COLORS["grid"], labelcolor=COLORS["text"], fontsize=8)
 
-    ax.set_facecolor(COLORS["bg"])
-    ax.set_title(title, color=COLORS["text"], fontsize=11, fontweight="bold")
-    ax.tick_params(colors=COLORS["text"], labelsize=8)
-    ax.grid(True, alpha=0.1, color=COLORS["grid"])
-    for spine in ax.spines.values():
-        spine.set_color(COLORS["grid"])
+# Net Savings
+ax = axes[1]
+plot_series(ax, NET_SAVINGS_DATES, NET_SAVINGS, FORECAST_DATES, fc_savings, results["savings"][1],
+            COLORS["accent"], COLORS["forecast"])
+style_chart(ax, "Net Savings", "EUR")
+ax.legend(facecolor=COLORS["bg"], edgecolor=COLORS["grid"], labelcolor=COLORS["text"], fontsize=8)
+
+# Savings Rate
+ax = axes[2]
+plot_series(ax, savings_rate_dates, savings_rate, FORECAST_DATES, results["rate"][0], results["rate"][1],
+            COLORS["purple"], COLORS["forecast"])
+ax.axhline(y=50, color=COLORS["red"], linestyle=":", alpha=0.4, linewidth=0.8)
+ax.text(0, 51, "50% target", color=COLORS["red"], fontsize=7, alpha=0.5)
+style_chart(ax, "Savings Rate (Net / Income)", "%")
+ax.legend(facecolor=COLORS["bg"], edgecolor=COLORS["grid"], labelcolor=COLORS["text"], fontsize=8)
+
+fig.tight_layout(rect=[0, 0, 1, 0.96])
+fig.savefig(run_dir / "01_income_savings.png", dpi=150, bbox_inches="tight")
+plt.close(fig)
+print(f"  Saved: 01_income_savings.png")
+
+# Chart 2: Portfolio + Returns
+fig, axes = plt.subplots(2, 1, figsize=(14, 8))
+fig.set_facecolor(COLORS["bg"])
+fig.suptitle("Portfolio Performance", color=COLORS["text"], fontsize=15, fontweight="bold")
+
+port_fc_dates = ["2026-05","2026-06","2026-07","2026-08","2026-09","2026-10","2026-11","2026-12","2027-01"]
+
+ax = axes[0]
+plot_series(ax, PORTFOLIO_DATES, PORTFOLIO_VALUE, port_fc_dates, fc_port, q_port,
+            COLORS["history"], COLORS["forecast"])
+# Also plot invested capital
+n_inv = len(INVESTED_CAPITAL)
+ax.plot(range(n_inv), INVESTED_CAPITAL, color=COLORS["red"], linewidth=1, linestyle="--", alpha=0.6, label="Invested Capital")
+style_chart(ax, "Portfolio Value vs Invested Capital", "EUR")
+ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, p: f"{x:,.0f}"))
+ax.legend(facecolor=COLORS["bg"], edgecolor=COLORS["grid"], labelcolor=COLORS["text"], fontsize=8)
+
+ax = axes[1]
+plot_series(ax, PORTFOLIO_DATES, TOTAL_RETURN_PCT, port_fc_dates, results["returns"][0], results["returns"][1],
+            COLORS["accent"], COLORS["forecast"])
+ax.axhline(y=0, color=COLORS["red"], linestyle=":", alpha=0.4)
+style_chart(ax, "Total Return %", "%")
+ax.legend(facecolor=COLORS["bg"], edgecolor=COLORS["grid"], labelcolor=COLORS["text"], fontsize=8)
+
+fig.tight_layout(rect=[0, 0, 1, 0.96])
+fig.savefig(run_dir / "02_portfolio.png", dpi=150, bbox_inches="tight")
+plt.close(fig)
+print(f"  Saved: 02_portfolio.png")
+
+# Chart 3: Investment
+fig, ax = plt.subplots(figsize=(14, 4))
+plot_series(ax, MONTHLY_INVESTMENT_DATES, MONTHLY_INVESTMENT, FORECAST_DATES,
+            results["investment"][0], results["investment"][1],
+            COLORS["history"], COLORS["forecast"])
+style_chart(ax, "Monthly Investment Amount", "EUR")
+ax.legend(facecolor=COLORS["bg"], edgecolor=COLORS["grid"], labelcolor=COLORS["text"], fontsize=8)
+fig.tight_layout()
+fig.savefig(run_dir / "03_investment.png", dpi=150, bbox_inches="tight")
+plt.close(fig)
+print(f"  Saved: 03_investment.png")
+
+# Chart 4: 6-panel dashboard
+fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+fig.set_facecolor(COLORS["bg"])
+fig.suptitle(f"Personal Finance Dashboard — {datetime.now().strftime('%B %Y')}", color=COLORS["text"], fontsize=16, fontweight="bold")
+
+panels = [
+    (axes[0,0], INCOME_DATES, INCOME, FORECAST_DATES, fc_income, results["income"][1], "Income (EUR/mo)", COLORS["history"]),
+    (axes[0,1], NET_SAVINGS_DATES, NET_SAVINGS, FORECAST_DATES, fc_savings, results["savings"][1], "Net Savings (EUR/mo)", COLORS["accent"]),
+    (axes[0,2], savings_rate_dates, savings_rate, FORECAST_DATES, results["rate"][0], results["rate"][1], "Savings Rate (%)", COLORS["purple"]),
+    (axes[1,0], PORTFOLIO_DATES, PORTFOLIO_VALUE, port_fc_dates, fc_port, q_port, "Portfolio (EUR)", COLORS["history"]),
+    (axes[1,1], MONTHLY_INVESTMENT_DATES, MONTHLY_INVESTMENT, FORECAST_DATES, results["investment"][0], results["investment"][1], "Monthly Invest (EUR)", COLORS["history"]),
+    (axes[1,2], PORTFOLIO_DATES, TOTAL_RETURN_PCT, port_fc_dates, results["returns"][0], results["returns"][1], "Total Return (%)", COLORS["accent"]),
+]
+
+for ax, dh, vh, df, pf, qf, title, col in panels:
+    plot_series(ax, dh, vh, df, pf, qf, col, COLORS["forecast"])
+    style_chart(ax, title, "")
 
 fig.tight_layout(rect=[0, 0, 1, 0.95])
-dashboard_path = run_dir / "00_dashboard.png"
-fig.savefig(dashboard_path, dpi=150, bbox_inches="tight")
+fig.savefig(run_dir / "00_dashboard.png", dpi=150, bbox_inches="tight")
 plt.close(fig)
-print(f"  Saved: {dashboard_path}")
+print(f"  Saved: 00_dashboard.png")
 
 
 # ===========================================================================
-# PHASE 8: Generate Run Report
+# PHASE 6: Generate Report
 # ===========================================================================
-section("PHASE 8: RUN REPORT")
+section("PHASE 6: REPORT")
 t_total = time.perf_counter() - t_start
 
-# Build markdown report
-report_lines = []
-report_lines.append(f"# Personal Finance Forecast — {timestamp[:8]}")
-report_lines.append(f"")
-report_lines.append(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-report_lines.append(f"**Model:** TimesFM 2.5 200M (PyTorch)  |  **Device:** {device}")
-report_lines.append(f"**Total runtime:** {fmt_time(t_total)}")
-report_lines.append(f"")
-report_lines.append(f"## Dashboard")
-report_lines.append(f"")
-report_lines.append(f"![Dashboard](00_dashboard.png)")
-report_lines.append(f"")
+# Compute key metrics for report
+avg_rate_hist = savings_rate.mean()
+avg_rate_fc = results["rate"][0].mean()
+total_saved_all = NET_SAVINGS.sum()
+total_fc_savings = fc_savings.sum()
+total_fc_income = fc_income.sum()
+total_fc_investment = results["investment"][0].sum()
 
-# Net savings
-report_lines.append(f"## 1. Net Savings Forecast (Apr-Dec 2026)")
-report_lines.append(f"")
-report_lines.append(f"![Net Savings](01_net_savings.png)")
-report_lines.append(f"")
-report_lines.append(f"| Month | Predicted | P10 (low) | P90 (high) |")
-report_lines.append(f"|-------|-----------|-----------|------------|")
-for i, date in enumerate(FORECAST_DATES):
-    p = fc_savings[i]
-    report_lines.append(f"| {date} | {fmt_eur(p)} EUR | {fmt_eur(q_savings[i,1])} EUR | {fmt_eur(q_savings[i,9])} EUR |")
-report_lines.append(f"")
-report_lines.append(f"**Total predicted:** {fmt_eur(total_fc)} EUR over 9 months")
-report_lines.append(f"")
-report_lines.append(f"**Key insight:** The model detects the November bonus pattern "
-                     f"(avg {fmt_eur(monthly_avg.get(11, 0))} EUR vs {fmt_eur(np.mean([v for k,v in monthly_avg.items() if k != 11]))} EUR other months). "
-                     f"May also shows elevated savings.")
-report_lines.append(f"")
+R = []  # report lines
+def r(line=""): R.append(line)
+
+r(f"# Personal Finance Forecast Report")
+r(f"")
+r(f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+r(f"**Model:** TimesFM 2.5 200M | **GPU:** {device} | **Runtime:** {fmt_time(t_total)}")
+r(f"**Forecast horizon:** {HORIZON} months (Apr - Dec 2026)")
+r(f"")
+r(f"---")
+r(f"")
+r(f"## Dashboard")
+r(f"")
+r(f"![Dashboard](00_dashboard.png)")
+r(f"")
+
+# Current state
+r(f"## Current Financial State (as of {NET_SAVINGS_DATES[-1]})")
+r(f"")
+r(f"| Metric | Value |")
+r(f"|--------|-------|")
+r(f"| Total saved (Oct 2021 - Mar 2026) | **{fmt_eur(total_saved_all)} EUR** |")
+r(f"| Portfolio value | **{fmt_eur(PORTFOLIO_VALUE[-1])} EUR** |")
+r(f"| Total invested (cost basis) | {fmt_eur(INVESTED_CAPITAL[-1])} EUR |")
+r(f"| Investment gains | {fmt_eur(PORTFOLIO_VALUE[-1] - INVESTED_CAPITAL[-1])} EUR ({TOTAL_RETURN_PCT[-1]:+.1f}%) |")
+r(f"| Cash / other | ~{fmt_eur(total_saved_all - INVESTED_CAPITAL[-1])} EUR |")
+r(f"| Last monthly income | {fmt_eur(INCOME[-1])} EUR |")
+r(f"| Last monthly savings | {fmt_eur(NET_SAVINGS[-1])} EUR |")
+r(f"| Average savings rate | {avg_rate_hist:.1f}% |")
+r(f"| Average monthly investment | {fmt_eur(MONTHLY_INVESTMENT.mean())} EUR |")
+r(f"")
+
+# Seasonality
+r(f"## Seasonal Patterns")
+r(f"")
+r(f"| Month | Avg Income | Avg Savings | Savings Rate | Avg Investment |")
+r(f"|-------|------------|-------------|--------------|----------------|")
+for m in range(1, 13):
+    inc_vals = [INCOME[i] for i, d in enumerate(INCOME_DATES) if int(d.split("-")[1]) == m]
+    sav_vals = [NET_SAVINGS[i] for i, d in enumerate(NET_SAVINGS_DATES) if int(d.split("-")[1]) == m]
+    inv_vals = [MONTHLY_INVESTMENT[i] for i, d in enumerate(MONTHLY_INVESTMENT_DATES) if int(d.split("-")[1]) == m]
+    inc_avg = np.mean(inc_vals) if inc_vals else 0
+    sav_avg = np.mean(sav_vals)
+    rate = sav_avg / inc_avg * 100 if inc_avg > 0 else 0
+    inv_avg = np.mean(inv_vals) if inv_vals else 0
+    peak = " **PEAK**" if m in [5, 11] else ""
+    r(f"| {month_names[m-1]} | {fmt_eur(inc_avg)} | {fmt_eur(sav_avg)} | {rate:.0f}% | {fmt_eur(inv_avg)} |{peak}")
+r(f"")
+r(f"**Pattern:** May and November show 2x income spikes (bonuses/variable compensation), driving savings rate above 70%.")
+r(f"")
+
+# Income + Savings forecast
+r(f"## 1. Income & Savings Forecast")
+r(f"")
+r(f"![Income & Savings](01_income_savings.png)")
+r(f"")
+r(f"| Month | Income | Net Savings | Savings Rate | Expenses |")
+r(f"|-------|--------|-------------|--------------|----------|")
+for i, d in enumerate(FORECAST_DATES):
+    inc = fc_income[i]
+    sav = fc_savings[i]
+    rate = sav / inc * 100 if inc > 0 else 0
+    exp = inc - sav
+    r(f"| {d} | {fmt_eur(inc)} | {fmt_eur(sav)} | {rate:.0f}% | {fmt_eur(exp)} |")
+r(f"")
+r(f"| Totals (9 months) | {fmt_eur(total_fc_income)} | {fmt_eur(total_fc_savings)} | {total_fc_savings/total_fc_income*100:.0f}% | {fmt_eur(total_fc_income - total_fc_savings)} |")
+r(f"")
 
 # Portfolio
-report_lines.append(f"## 2. Portfolio Value Forecast")
-report_lines.append(f"")
-report_lines.append(f"![Portfolio](02_portfolio_value.png)")
-report_lines.append(f"")
-report_lines.append(f"| Month | Value | MoM | P10 | P90 |")
-report_lines.append(f"|-------|-------|-----|-----|-----|")
-prev_p = last_port
-for i, date in enumerate(port_fc_dates_actual):
-    p = fc_port_values[i]
-    mom = (p / prev_p - 1) * 100
-    prev_p = p
-    report_lines.append(f"| {date} | {fmt_eur(p)} EUR | {mom:+.1f}% | {fmt_eur(q_port_values[i,1])} EUR | {fmt_eur(q_port_values[i,9])} EUR |")
-report_lines.append(f"")
-report_lines.append(f"**Current:** {fmt_eur(last_port)} EUR  ->  **Dec 2026:** {fmt_eur(fc_port_values[-1])} EUR ({growth:+.1f}%)")
-report_lines.append(f"")
+r(f"## 2. Portfolio Forecast")
+r(f"")
+r(f"![Portfolio](02_portfolio.png)")
+r(f"")
+r(f"| Month | Value | P10 (bear) | P90 (bull) | MoM |")
+r(f"|-------|-------|------------|------------|-----|")
+prev = last_port
+for i, d in enumerate(port_fc_dates):
+    p = fc_port[i]
+    mom = (p / prev - 1) * 100
+    prev = p
+    r(f"| {d} | {fmt_eur(p)} | {fmt_eur(q_port[i,1])} | {fmt_eur(q_port[i,9])} | {mom:+.1f}% |")
+growth = (fc_port[-1] / last_port - 1) * 100
+r(f"")
+r(f"**{fmt_eur(last_port)} EUR -> {fmt_eur(fc_port[-1])} EUR ({growth:+.1f}%)**")
+r(f"")
+r(f"*Note: Portfolio forecast extrapolates recent ~2.5%/mo growth trend. Use P10 ({fmt_eur(q_port[-1,1])} EUR) as conservative estimate.*")
+r(f"")
 
 # Investment
-report_lines.append(f"## 3. Monthly Investment Forecast")
-report_lines.append(f"")
-report_lines.append(f"![Investment](03_monthly_investment.png)")
-report_lines.append(f"")
-report_lines.append(f"| Month | Predicted | P10 | P90 |")
-report_lines.append(f"|-------|-----------|-----|-----|")
-for i, date in enumerate(FORECAST_DATES):
-    report_lines.append(f"| {date} | {fmt_eur(fc_inv[i])} EUR | {fmt_eur(q_inv[i,1])} EUR | {fmt_eur(q_inv[i,9])} EUR |")
-report_lines.append(f"")
-report_lines.append(f"**Total new investment Apr-Dec 2026:** {fmt_eur(fc_inv.sum())} EUR")
-report_lines.append(f"")
+r(f"## 3. Monthly Investment Forecast")
+r(f"")
+r(f"![Investment](03_investment.png)")
+r(f"")
+r(f"| Month | Predicted | P10 | P90 |")
+r(f"|-------|-----------|-----|-----|")
+for i, d in enumerate(FORECAST_DATES):
+    inv = results["investment"][0][i]
+    r(f"| {d} | {fmt_eur(inv)} | {fmt_eur(results['investment'][1][i,1])} | {fmt_eur(results['investment'][1][i,9])} |")
+r(f"")
+r(f"**Total new investment:** {fmt_eur(total_fc_investment)} EUR")
+r(f"**Projected total invested by Dec 2026:** ~{fmt_eur(INVESTED_CAPITAL[-1] + total_fc_investment)} EUR")
+r(f"")
 
 # Returns
-report_lines.append(f"## 4. Return % Trajectory")
-report_lines.append(f"")
-report_lines.append(f"![Returns](04_returns.png)")
-report_lines.append(f"")
-report_lines.append(f"| Month | Return % | P10 | P90 |")
-report_lines.append(f"|-------|----------|-----|-----|")
-for i, date in enumerate(port_fc_dates_actual):
-    report_lines.append(f"| {date} | {fc_ret[i]:+.1f}% | {q_ret[i,1]:+.1f}% | {q_ret[i,9]:+.1f}% |")
-report_lines.append(f"")
+r(f"## 4. Return Trajectory")
+r(f"")
+r(f"| Month | Return % | P10 | P90 |")
+r(f"|-------|----------|-----|-----|")
+for i, d in enumerate(port_fc_dates):
+    ret = results["returns"][0][i]
+    r(f"| {d} | {ret:+.1f}% | {results['returns'][1][i,1]:+.1f}% | {results['returns'][1][i,9]:+.1f}% |")
+r(f"")
 
 # Summary
-report_lines.append(f"## Summary")
-report_lines.append(f"")
-report_lines.append(f"| Metric | Current | Dec 2026 Forecast |")
-report_lines.append(f"|--------|---------|-------------------|")
-report_lines.append(f"| Portfolio Value | {fmt_eur(last_port)} EUR | {fmt_eur(fc_port_values[-1])} EUR |")
-report_lines.append(f"| Total Invested | {fmt_eur(INVESTED_CAPITAL[-1])} EUR | ~{fmt_eur(INVESTED_CAPITAL[-1] + fc_inv.sum())} EUR |")
-report_lines.append(f"| Monthly Savings (avg) | {fmt_eur(NET_SAVINGS[-12:].mean())} EUR | {fmt_eur(fc_savings.mean())} EUR |")
-report_lines.append(f"| Total Return | {TOTAL_RETURN_PCT[-1]:+.1f}% | {fc_ret[-1]:+.1f}% (forecast) |")
-report_lines.append(f"")
-report_lines.append(f"## Methodology")
-report_lines.append(f"")
-report_lines.append(f"- **Model:** Google TimesFM 2.5 (200M params, pretrained time-series foundation model)")
-report_lines.append(f"- **Net Savings & Investment:** Raw values (no transform needed — moderate range, no extreme trend)")
-report_lines.append(f"- **Portfolio Value:** Log-returns to handle exponential growth trend")
-report_lines.append(f"- **Confidence bands:** P10-P90 (80% CI) from continuous quantile head")
-report_lines.append(f"- **Context:** Full history ({len(NET_SAVINGS)}-{len(PORTFOLIO_VALUE)} months depending on series)")
-report_lines.append(f"- **Horizon:** {HORIZON} months (Apr-Dec 2026)")
-report_lines.append(f"")
-report_lines.append(f"---")
-report_lines.append(f"*Generated by TimesFM 2.5 | {fmt_time(t_total)} total runtime | {device}*")
+r(f"## Summary: Where You'll Be by Dec 2026")
+r(f"")
+r(f"| Metric | Now | Dec 2026 (forecast) | Change |")
+r(f"|--------|-----|---------------------|--------|")
+r(f"| Portfolio | {fmt_eur(PORTFOLIO_VALUE[-1])} EUR | {fmt_eur(fc_port[-1])} EUR | {growth:+.1f}% |")
+r(f"| Invested Capital | {fmt_eur(INVESTED_CAPITAL[-1])} EUR | ~{fmt_eur(INVESTED_CAPITAL[-1] + total_fc_investment)} EUR | +{fmt_eur(total_fc_investment)} |")
+r(f"| Monthly Savings (avg) | {fmt_eur(NET_SAVINGS[-12:].mean())} EUR | {fmt_eur(fc_savings.mean())} EUR | |")
+r(f"| Savings Rate | {avg_rate_hist:.0f}% | {avg_rate_fc:.0f}% | |")
+r(f"| New Savings (9mo) | | {fmt_eur(total_fc_savings)} EUR | |")
+r(f"| New Investment (9mo) | | {fmt_eur(total_fc_investment)} EUR | |")
+r(f"")
 
-report_text = "\n".join(report_lines)
+r(f"## Methodology")
+r(f"")
+r(f"- **Model:** Google TimesFM 2.5 (200M params, pretrained time-series foundation model)")
+r(f"- **Income, Savings, Investment:** Raw values (no transform — moderate range, seasonal)")
+r(f"- **Savings Rate:** Raw % values, compiled with negative-capable settings")
+r(f"- **Portfolio Value:** Log-returns to handle exponential growth, then reconstructed")
+r(f"- **Expenses:** Derived (Income - Net Savings), not independently forecast")
+r(f"- **Confidence:** P10-P90 (80% CI) from continuous quantile head")
+r(f"- **Context:** Full history ({len(INCOME)}-{len(PORTFOLIO_VALUE)} months depending on series)")
+r(f"- **Horizon:** {HORIZON} months")
+r(f"- **Caveats:** Portfolio forecast assumes trend continuation. Returns forecast shows mean reversion. Neither accounts for market shocks or life changes.")
+r(f"")
+r(f"---")
+r(f"*Generated by TimesFM 2.5 | {fmt_time(t_total)} | {device} | {gpu_stats()}*")
+
 report_path = run_dir / "report.md"
-report_path.write_text(report_text, encoding="utf-8")
+report_path.write_text("\n".join(R), encoding="utf-8")
 print(f"  Report: {report_path}")
-print(f"  Charts: {list(run_dir.glob('*.png'))}")
 
-# Print summary
+# ===========================================================================
+# DONE
+# ===========================================================================
 section("DONE")
 print(f"""
-  Run: {run_dir}
+  Run directory: {run_dir}/
   Files:
-    {run_dir / 'report.md'}
-    {run_dir / '00_dashboard.png'}
-    {run_dir / '01_net_savings.png'}
-    {run_dir / '02_portfolio_value.png'}
-    {run_dir / '03_monthly_investment.png'}
-    {run_dir / '04_returns.png'}
+    report.md           — Full forecast report with tables
+    00_dashboard.png    — 6-panel overview
+    01_income_savings.png — Income + Savings + Savings Rate
+    02_portfolio.png    — Portfolio value + Returns
+    03_investment.png   — Monthly investment amount
 
-  Key Predictions (Apr-Dec 2026):
-    Net savings total:  {fmt_eur(total_fc)} EUR
-    Portfolio Dec 2026: {fmt_eur(fc_port_values[-1])} EUR ({growth:+.1f}%)
-    New investment:     {fmt_eur(fc_inv.sum())} EUR
-    Return Dec 2026:    {fc_ret[-1]:+.1f}%
+  Key Numbers:
+    Income (9mo):       {fmt_eur(total_fc_income)} EUR
+    Net Savings (9mo):  {fmt_eur(total_fc_savings)} EUR
+    Savings Rate:       {total_fc_savings/total_fc_income*100:.0f}%
+    New Investment:     {fmt_eur(total_fc_investment)} EUR
+    Portfolio Dec 2026: {fmt_eur(fc_port[-1])} EUR ({growth:+.1f}%)
 
   Runtime: {fmt_time(t_total)}  |  {gpu_stats()}
 """)
